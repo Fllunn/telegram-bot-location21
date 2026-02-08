@@ -50,6 +50,13 @@ export class SettingsService {
     return this.strictBusinessConnection;
   }
 
+  getOwnerIds(): number[] {
+    if (this.ownerIds.size === 0) {
+      this.loadOwnersFromEnv(false);
+    }
+    return Array.from(this.ownerIds);
+  }
+
   private loadOwnersFromEnv(isStartup: boolean): void {
     const raw = (process.env.OWNER_ID ?? '').trim();
     const ids = raw

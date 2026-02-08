@@ -1,4 +1,7 @@
 export const AI_MODEL = process.env.AI_MODEL ?? 'openai/gpt-4o-mini';
+const rawDelaySeconds = Number((process.env.AI_REQUEST_DELAY_MS ?? '').trim());
+const delaySeconds = Number.isFinite(rawDelaySeconds) && rawDelaySeconds > 0 ? rawDelaySeconds : 5;
+export const AI_REQUEST_DELAY_MS = Math.round(delaySeconds * 1000);
 export const AI_SYSTEM_PROMPT = `Ты — помощник записи на услуги. Собираешь: Услуга, Мастер, Время.
 
 Тон: будь тёплым, вежливым и человечным. Отвечай просто, дружелюбно и с эмпатией, как живой администратор: коротко, открыто, но экономно по словам.
