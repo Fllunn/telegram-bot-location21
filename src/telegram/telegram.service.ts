@@ -10,6 +10,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly lastMessages = new Map<number, Message>();
   private pollingActive = false;
   private updateOffset?: number;
+  private readonly allowedBusinessConnections = new Set<string>();
+  private readonly businessConnectionOwners = new Map<string, number>();
   private readonly allowedUpdates = [
     'message',
     'business_message',
@@ -64,8 +66,18 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     this.logIncomingMessage(msg, source);
 
     const fromId = msg.from?.id;
-    if (!this.settingsService.isOwner(fromId)) {
-      this.logger.warn(`Message ignored (not owner). fromId=${fromId ?? 'unknown'}`);
+    const chatIdForOwner = msg.chat?.id;
+    const businessConnectionId = (msg as any).business_connection_id as string | undefined;
+    const hasBusinessConnection = Boolean(businessConnectionId);
+    const allowed = hasBusinessConnection
+      ? await this.isBusinessConnectionAllowed(businessConnectionId)
+      : this.settingsService.isOwner(fromId);
+
+    if (!allowed) {
+      this.logger.warn(
+        `Message ignored (not owner). fromId=${fromId ?? 'unknown'} chatId=${chatIdForOwner ?? 'unknown'} ` +
+          `business=${hasBusinessConnection}`,
+      );
       return;
     }
 
@@ -207,7 +219,96 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       this.handleDeletedMessages(update.deleted_business_messages as any);
     }
     if (update?.business_connection) {
-      this.logger.log(`Business connection update (raw): ${JSON.stringify(update.business_connection)}`);
+      this.handleBusinessConnection(update.business_connection);
+    }
+  }
+
+  private async isBusinessConnectionAllowed(businessConnectionId?: string): Promise<boolean> {
+    if (this.settingsService.isOwner(undefined)) {
+      return true;
+    }
+
+    if (!businessConnectionId) {
+      return false;
+    }
+
+    if (this.allowedBusinessConnections.has(businessConnectionId)) {
+      return true;
+    }
+
+    if (this.settingsService.isStrictBusinessConnection()) {
+      const resolvedOwnerId = await this.resolveBusinessConnectionOwner(businessConnectionId);
+      if (resolvedOwnerId && this.settingsService.isOwner(resolvedOwnerId)) {
+        this.allowedBusinessConnections.add(businessConnectionId);
+        this.businessConnectionOwners.set(businessConnectionId, resolvedOwnerId);
+        this.logger.log(
+          `Business connection resolved via API and allowed: ${businessConnectionId} (userId=${resolvedOwnerId})`,
+        );
+        return true;
+      }
+
+      this.logger.warn(`Business connection not registered via update. Blocking: ${businessConnectionId}`);
+      return false;
+    }
+
+    this.allowedBusinessConnections.add(businessConnectionId);
+    this.logger.warn(
+      `Business connection not registered via update. Allowing and caching: ${businessConnectionId}`,
+    );
+    return true;
+  }
+
+  private async resolveBusinessConnectionOwner(businessConnectionId: string): Promise<number | undefined> {
+    const cached = this.businessConnectionOwners.get(businessConnectionId);
+    if (cached) {
+      return cached;
+    }
+
+    const bot = this.ensureBot() as any;
+
+    try {
+      if (typeof bot.getBusinessConnection === 'function') {
+        const connection = await bot.getBusinessConnection(businessConnectionId);
+        return (connection?.user?.id as number | undefined) ?? (connection?.user_id as number | undefined);
+      }
+
+      if (typeof bot._request === 'function') {
+        const connection = await bot._request('getBusinessConnection', {
+          qs: { business_connection_id: businessConnectionId },
+        });
+        return (connection?.user?.id as number | undefined) ?? (connection?.user_id as number | undefined);
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Failed to resolve business connection owner for ${businessConnectionId}: ${(err as Error).message}`,
+      );
+    }
+
+    return undefined;
+  }
+
+  private handleBusinessConnection(connection: any): void {
+    const connectionId =
+      (connection?.id as string | undefined) ??
+      (connection?.business_connection_id as string | undefined) ??
+      (connection?.connection_id as string | undefined);
+    const userId =
+      (connection?.user?.id as number | undefined) ??
+      (connection?.user_id as number | undefined) ??
+      (connection?.owner_id as number | undefined);
+
+    if (!connectionId) {
+      this.logger.warn(`Business connection update missing id: ${JSON.stringify(connection)}`);
+      return;
+    }
+
+    if (this.settingsService.isOwner(userId)) {
+      this.allowedBusinessConnections.add(connectionId);
+      this.logger.log(`Business connection allowed: ${connectionId} (userId=${userId ?? 'unknown'})`);
+    } else {
+      this.logger.warn(
+        `Business connection ignored: ${connectionId} (userId=${userId ?? 'unknown'}) not in OWNER_ID`,
+      );
     }
   }
 }
