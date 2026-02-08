@@ -1,16 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import TelegramBot, { Message } from 'node-telegram-bot-api';
 import { AdminStoreService } from '../admin/admin-store.service';
-import { AutoReplyService } from './auto-reply.service';
 import { BusinessAccessService } from './business-access.service';
+import { BOT_START_MESSAGE } from './start-messages';
 import { SettingsService } from './settings.service';
 
 @Injectable()
 export class BotMessageService {
-  private readonly logger = new Logger(BotMessageService.name);
-
   constructor(
-    private readonly autoReplyService: AutoReplyService,
     private readonly settingsService: SettingsService,
     private readonly adminStoreService: AdminStoreService,
     private readonly businessAccessService: BusinessAccessService,
@@ -33,14 +30,27 @@ export class BotMessageService {
   }
 
   async handle(bot: TelegramBot, msg: Message): Promise<void> {
-    if (msg.text && msg.text.trim().startsWith('/')) {
-      const handled = await this.handleOwnerCommand(bot, msg);
-      if (handled) {
-        return;
-      }
+    const text = msg.text?.trim() ?? '';
+    const fromId = msg.from?.id;
+    const chatId = msg.chat?.id;
+    if (!chatId || !fromId) {
+      return;
     }
 
-    await this.autoReplyService.echo(bot, msg, 'bot');
+    if (text.startsWith('/')) {
+      if (this.settingsService.isOwner(fromId)) {
+        const handled = await this.handleOwnerCommand(bot, msg);
+        if (handled) {
+          return;
+        }
+      }
+
+      if (!this.settingsService.isOwner(fromId) && (await this.adminStoreService.isAdmin(fromId))) {
+        if (text.startsWith('/start')) {
+          await bot.sendMessage(chatId, BOT_START_MESSAGE);
+        }
+      }
+    }
   }
 
   private async handleOwnerCommand(bot: TelegramBot, msg: Message): Promise<boolean> {
