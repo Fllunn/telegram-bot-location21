@@ -12,6 +12,8 @@ const LABEL_TIME = 'Время';
 
 @Injectable()
 export class BusinessMessageService {
+  private readonly lastFinalByChat = new Map<number, string>();
+
   constructor(
     private readonly aiService: AiService,
     private readonly businessAccessService: BusinessAccessService,
@@ -34,13 +36,32 @@ export class BusinessMessageService {
     if (!input || !input.trim()) {
       return;
     }
+    const trimmedInput = input.trim();
+    if (trimmedInput.length > 200) {
+      const businessConnectionId = (msg as any).business_connection_id as string | undefined;
+      const baseOptions = businessConnectionId ? { business_connection_id: businessConnectionId } : {};
+      await bot.sendMessage(chatId, 'Пожалуйста, сократите сообщение до 200 символов.', {
+        ...baseOptions,
+        reply_to_message_id: msg.message_id,
+        parse_mode: 'Markdown',
+      } as any);
+      return;
+    }
 
-    const response = await this.aiService.generateBusinessReply(chatId, input.trim());
+    const response = await this.aiService.generateBusinessReply(chatId, trimmedInput);
     if (!response) {
       return;
     }
 
-    const filtered = this.filterStatusBlock(response);
+    const recommendation = this.aiService.takeComplexRecommendationForOutput(chatId);
+    let processed = response;
+    if (recommendation) {
+      processed = this.stripAdditionalServiceRecommendation(processed);
+      processed = this.stripInlineComplexRecommendation(processed);
+      processed = this.appendComplexRecommendation(processed, recommendation);
+    }
+    const enriched = this.enforceFinalPhrase(chatId, processed);
+    const filtered = this.normalizeBlankLines(this.filterStatusBlock(enriched));
     if (!filtered.trim()) {
       return;
     }
@@ -51,10 +72,11 @@ export class BusinessMessageService {
     await bot.sendMessage(chatId, filtered, {
       ...baseOptions,
       reply_to_message_id: msg.message_id,
+      parse_mode: 'Markdown',
     } as any);
 
-    if (this.containsFinalPhrase(response)) {
-      await this.notifyAdmins(bot, msg, response);
+    if (this.containsFinalPhrase(enriched)) {
+      await this.notifyAdmins(bot, msg, enriched);
     }
   }
 
@@ -114,11 +136,191 @@ export class BusinessMessageService {
 
   private filterStatusBlock(text: string): string {
     const lines = text.split(/\r?\n/);
-    if (lines.length < 3) {
+    const status = this.parseStatusBlock(lines);
+    if (!status) {
       return text;
     }
 
-    const last3 = lines.slice(-3);
+    const hasUnknown = status.service === '?' || status.master === '?' || status.time === '?';
+    const isEmpty = !status.service || !status.master || !status.time;
+    if (hasUnknown || isEmpty) {
+      return lines.slice(0, -3).join('\n').trimEnd();
+    }
+
+    return text;
+  }
+
+  private enforceFinalPhrase(chatId: number, text: string): string {
+    const lines = text.split(/\r?\n/);
+    const status = this.parseStatusBlock(lines);
+    if (!status) {
+      return this.stripFinalPhrase(text);
+    }
+
+    const hasUnknown = status.service === '?' || status.master === '?' || status.time === '?';
+    const isEmpty = !status.service || !status.master || !status.time;
+    if (hasUnknown || isEmpty) {
+      return this.stripFinalPhrase(text);
+    }
+
+    const signature = `${status.service}||${status.master}||${status.time}`;
+    const lastSignature = this.lastFinalByChat.get(chatId);
+    if (lastSignature === signature) {
+      return this.stripFinalPhrase(text);
+    }
+
+    if (this.containsFinalPhrase(text)) {
+      this.lastFinalByChat.set(chatId, signature);
+      return text;
+    }
+    this.lastFinalByChat.set(chatId, signature);
+    return `${text.trimEnd()}\n\n${FINAL_PHRASE}`;
+  }
+
+  private appendComplexRecommendation(text: string, recommendation: string): string {
+    if (text.includes(recommendation)) {
+      return text;
+    }
+
+    const lines = text.split(/\r?\n/);
+    const statusIndex = this.findStatusBlockIndex(lines);
+    if (statusIndex === -1) {
+      return `${text.trimEnd()}\n\n${recommendation}\n\n`;
+    }
+
+    const before = lines.slice(0, statusIndex);
+    const status = lines.slice(statusIndex);
+    const merged = [
+      ...before,
+      '',
+      recommendation,
+      '',
+      ...status,
+    ];
+    return merged.join('\n').trimEnd();
+  }
+
+  private findStatusBlockIndex(lines: string[]): number {
+    const isLine = (line: string, label: string): boolean => line.startsWith(`${label}:`);
+    for (let i = lines.length - 3; i >= 0; i -= 1) {
+      if (isLine(lines[i], LABEL_SERVICE) && isLine(lines[i + 1], LABEL_MASTER) && isLine(lines[i + 2], LABEL_TIME)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private normalizeBlankLines(text: string): string {
+    const lines = text.split(/\r?\n/);
+    const normalized: string[] = [];
+    let prevBlank = false;
+    for (const line of lines) {
+      const isBlank = !line.trim();
+      if (isBlank) {
+        if (prevBlank) {
+          continue;
+        }
+        prevBlank = true;
+        normalized.push('');
+        continue;
+      }
+      prevBlank = false;
+      normalized.push(line);
+    }
+    return normalized.join('\n').trimEnd();
+  }
+
+  private stripAdditionalServiceRecommendation(text: string): string {
+    const triggers = [
+      'Ультразвуковая чистка лица',
+      'Глиняная маска',
+      'Восковая эпиляция',
+    ];
+    const lines = text.split(/\r?\n/);
+    const cleaned: string[] = [];
+    let skip = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      const isStatusLine =
+        trimmed.startsWith(`${LABEL_SERVICE}:`) ||
+        trimmed.startsWith(`${LABEL_MASTER}:`) ||
+        trimmed.startsWith(`${LABEL_TIME}:`);
+
+      if (skip) {
+        if (!trimmed || isStatusLine) {
+          skip = false;
+          if (isStatusLine) {
+            cleaned.push(line);
+          }
+        }
+        continue;
+      }
+
+      const hasTrigger =
+        trimmed.toLowerCase().includes('дополнительн') ||
+        triggers.some((trigger) => trimmed.includes(trigger));
+
+      if (hasTrigger) {
+        skip = true;
+        continue;
+      }
+
+      cleaned.push(line);
+    }
+
+    return cleaned.join('\n').trimEnd();
+  }
+
+  private stripInlineComplexRecommendation(text: string): string {
+    const triggers = ['комплекс', 'скидка'];
+    const lines = text.split(/\r?\n/);
+    const cleaned: string[] = [];
+    let skip = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      const isStatusLine =
+        trimmed.startsWith(`${LABEL_SERVICE}:`) ||
+        trimmed.startsWith(`${LABEL_MASTER}:`) ||
+        trimmed.startsWith(`${LABEL_TIME}:`);
+
+      if (skip) {
+        if (!trimmed || isStatusLine) {
+          skip = false;
+          if (isStatusLine) {
+            cleaned.push(line);
+          }
+        }
+        continue;
+      }
+
+      const lower = trimmed.toLowerCase();
+      const hasTrigger = triggers.some((trigger) => lower.includes(trigger));
+      if (hasTrigger) {
+        skip = true;
+        continue;
+      }
+
+      cleaned.push(line);
+    }
+
+    return cleaned.join('\n').trimEnd();
+  }
+
+  private stripFinalPhrase(text: string): string {
+    if (!this.containsFinalPhrase(text)) {
+      return text;
+    }
+    const lines = text
+      .split(/\r?\n/)
+      .filter((line) => line.trim() && line.trim() !== FINAL_PHRASE);
+    return lines.join('\n').trimEnd();
+  }
+
+  private parseStatusBlock(
+    lines: string[],
+  ): { service: string; master: string; time: string } | null {
     const parseValue = (line: string, label: string): string | null => {
       const prefix = `${label}:`;
       if (!line.startsWith(prefix)) {
@@ -126,21 +328,15 @@ export class BusinessMessageService {
       }
       return line.slice(prefix.length).trim();
     };
-
-    const service = parseValue(last3[0], LABEL_SERVICE);
-    const master = parseValue(last3[1], LABEL_MASTER);
-    const time = parseValue(last3[2], LABEL_TIME);
-
-    if (service === null || master === null || time === null) {
-      return text;
+    for (let i = lines.length - 3; i >= 0; i -= 1) {
+      const service = parseValue(lines[i], LABEL_SERVICE);
+      const master = parseValue(lines[i + 1], LABEL_MASTER);
+      const time = parseValue(lines[i + 2], LABEL_TIME);
+      if (service === null || master === null || time === null) {
+        continue;
+      }
+      return { service, master, time };
     }
-
-    const hasUnknown = service === '?' || master === '?' || time === '?';
-    const isEmpty = !service || !master || !time;
-    if (hasUnknown || isEmpty) {
-      return lines.slice(0, -3).join('\n').trimEnd();
-    }
-
-    return text;
+    return null;
   }
 }
