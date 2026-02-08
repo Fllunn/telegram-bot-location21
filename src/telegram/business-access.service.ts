@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import TelegramBot from 'node-telegram-bot-api';
-import { AdminStoreService } from './admin-store.service';
+import { AdminStoreService } from '../admin/admin-store.service';
 import { SettingsService } from './settings.service';
 
 @Injectable()
@@ -35,7 +35,7 @@ export class BusinessAccessService {
       const ownerAllowed = resolvedOwnerId
         ? this.settingsService.isOwner(resolvedOwnerId) || (await this.adminStoreService.isAdmin(resolvedOwnerId))
         : false;
-      if (ownerAllowed) {
+      if (ownerAllowed && resolvedOwnerId !== undefined) {
         this.allowedBusinessConnections.add(businessConnectionId);
         this.businessConnectionOwners.set(businessConnectionId, resolvedOwnerId);
         this.logger.log(

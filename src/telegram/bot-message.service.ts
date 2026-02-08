@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import TelegramBot, { Message } from 'node-telegram-bot-api';
-import { AdminStoreService } from './admin-store.service';
+import { AdminStoreService } from '../admin/admin-store.service';
 import { AutoReplyService } from './auto-reply.service';
 import { BusinessAccessService } from './business-access.service';
 import { SettingsService } from './settings.service';

@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
-import { Admin, AdminSchema } from './admin.schema';
-import { AdminStoreService } from './admin-store.service';
+import { Admin, AdminSchema } from '../admin/admin.schema';
+import { AdminStoreService } from '../admin/admin-store.service';
 import { AutoReplyService } from './auto-reply.service';
 import { BotMessageService } from './bot-message.service';
 import { BusinessAccessService } from './business-access.service';
