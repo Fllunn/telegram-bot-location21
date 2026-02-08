@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import TelegramBot, { Message } from 'node-telegram-bot-api';
+import { AdminStoreService } from './admin-store.service';
 import { AutoReplyService } from './auto-reply.service';
 import { SettingsService } from './settings.service';
 
@@ -23,6 +24,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly autoReplyService: AutoReplyService,
     private readonly settingsService: SettingsService,
+    private readonly adminStoreService: AdminStoreService,
   ) {}
 
   onModuleInit(): void {
@@ -71,7 +73,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const hasBusinessConnection = Boolean(businessConnectionId);
     const allowed = hasBusinessConnection
       ? await this.isBusinessConnectionAllowed(businessConnectionId)
-      : this.settingsService.isOwner(fromId);
+      : await this.isDirectMessageAllowed(fromId);
 
     if (!allowed) {
       this.logger.warn(
@@ -82,6 +84,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
+      if (msg.text && msg.text.trim().startsWith('/')) {
+        const handled = await this.handleOwnerCommand(msg);
+        if (handled) {
+          return;
+        }
+      }
+
       await this.autoReplyService.echo(this.ensureBot(), msg);
     } catch (err) {
       this.logger.error('Failed to auto-reply', err as Error);
@@ -223,6 +232,69 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async handleOwnerCommand(msg: Message): Promise<boolean> {
+    const text = msg.text?.trim() ?? '';
+    const chatId = msg.chat?.id;
+    const fromId = msg.from?.id;
+    if (!chatId || !fromId) {
+      return false;
+    }
+
+    if (!this.settingsService.isOwner(fromId)) {
+      return false;
+    }
+
+    if ((msg as any).business_connection_id) {
+      return false;
+    }
+
+    const [command, arg] = text.split(/\s+/, 2);
+
+    switch (command) {
+      case '/start': {
+        const help = [
+          'Available commands:',
+          '/add_admin <user_id> — add admin',
+          '/list_admins — list admins',
+          '/remove_admin <user_id> — remove admin',
+        ].join('\n');
+        await this.ensureBot().sendMessage(chatId, help);
+        return true;
+      }
+      case '/add_admin': {
+        const id = Number(arg);
+        if (!Number.isFinite(id)) {
+          await this.ensureBot().sendMessage(chatId, 'Usage: /add_admin <user_id>');
+          return true;
+        }
+        const ok = await this.adminStoreService.addAdmin(id);
+        await this.ensureBot().sendMessage(chatId, ok ? `Admin added: ${id}` : `Failed to add admin: ${id}`);
+        return true;
+      }
+      case '/list_admins': {
+        const list = await this.adminStoreService.listAdmins();
+        const response = list.length ? list.join('\n') : 'Admin list is empty';
+        await this.ensureBot().sendMessage(chatId, response);
+        return true;
+      }
+      case '/remove_admin': {
+        const id = Number(arg);
+        if (!Number.isFinite(id)) {
+          await this.ensureBot().sendMessage(chatId, 'Usage: /remove_admin <user_id>');
+          return true;
+        }
+        const removed = await this.adminStoreService.removeAdmin(id);
+        if (removed) {
+          this.revokeAdminAccess(id);
+        }
+        await this.ensureBot().sendMessage(chatId, removed ? `Admin removed: ${id}` : `Admin not found: ${id}`);
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
   private async isBusinessConnectionAllowed(businessConnectionId?: string): Promise<boolean> {
     if (this.settingsService.isOwner(undefined)) {
       return true;
@@ -238,7 +310,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
     if (this.settingsService.isStrictBusinessConnection()) {
       const resolvedOwnerId = await this.resolveBusinessConnectionOwner(businessConnectionId);
-      if (resolvedOwnerId && this.settingsService.isOwner(resolvedOwnerId)) {
+      const ownerAllowed = resolvedOwnerId
+        ? this.settingsService.isOwner(resolvedOwnerId) || (await this.adminStoreService.isAdmin(resolvedOwnerId))
+        : false;
+      if (ownerAllowed) {
         this.allowedBusinessConnections.add(businessConnectionId);
         this.businessConnectionOwners.set(businessConnectionId, resolvedOwnerId);
         this.logger.log(
@@ -302,13 +377,52 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    if (this.settingsService.isOwner(userId)) {
-      this.allowedBusinessConnections.add(connectionId);
-      this.logger.log(`Business connection allowed: ${connectionId} (userId=${userId ?? 'unknown'})`);
-    } else {
-      this.logger.warn(
-        `Business connection ignored: ${connectionId} (userId=${userId ?? 'unknown'}) not in OWNER_ID`,
-      );
+    if (!userId) {
+      this.logger.warn(`Business connection update missing user id: ${JSON.stringify(connection)}`);
+      return;
     }
+
+    const allow = this.settingsService.isOwner(userId);
+    if (allow) {
+      this.allowedBusinessConnections.add(connectionId);
+      this.businessConnectionOwners.set(connectionId, userId);
+      this.logger.log(`Business connection allowed: ${connectionId} (userId=${userId})`);
+      return;
+    }
+
+    // For admins, resolve lazily via API in strict mode.
+    if (!this.settingsService.isStrictBusinessConnection()) {
+      this.allowedBusinessConnections.add(connectionId);
+      this.businessConnectionOwners.set(connectionId, userId);
+      this.logger.log(`Business connection allowed (non-strict): ${connectionId} (userId=${userId})`);
+      return;
+    }
+
+    this.logger.warn(
+      `Business connection ignored: ${connectionId} (userId=${userId}) not in OWNER_ID`,
+    );
+  }
+
+  private revokeAdminAccess(userId: number): void {
+    for (const [connectionId, ownerId] of this.businessConnectionOwners.entries()) {
+      if (ownerId === userId) {
+        this.businessConnectionOwners.delete(connectionId);
+        this.allowedBusinessConnections.delete(connectionId);
+      }
+    }
+  }
+
+  private async isDirectMessageAllowed(fromId?: number): Promise<boolean> {
+    if (this.settingsService.isOwner(undefined)) {
+      return true;
+    }
+
+    if (!fromId) return false;
+
+    if (this.settingsService.isOwner(fromId)) {
+      return true;
+    }
+
+    return this.adminStoreService.isAdmin(fromId);
   }
 }
