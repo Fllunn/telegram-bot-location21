@@ -1,8 +1,8 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import TelegramBot, { Message } from 'node-telegram-bot-api';
-import { AdminStoreService } from './admin-store.service';
-import { AutoReplyService } from './auto-reply.service';
-import { SettingsService } from './settings.service';
+import { BotMessageService } from './bot-message.service';
+import { BusinessAccessService } from './business-access.service';
+import { BusinessMessageService } from './business-message.service';
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
@@ -11,8 +11,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly lastMessages = new Map<number, Message>();
   private pollingActive = false;
   private updateOffset?: number;
-  private readonly allowedBusinessConnections = new Set<string>();
-  private readonly businessConnectionOwners = new Map<string, number>();
   private readonly allowedUpdates = [
     'message',
     'business_message',
@@ -22,9 +20,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   ] as const;
 
   constructor(
-    private readonly autoReplyService: AutoReplyService,
-    private readonly settingsService: SettingsService,
-    private readonly adminStoreService: AdminStoreService,
+    private readonly botMessageService: BotMessageService,
+    private readonly businessMessageService: BusinessMessageService,
+    private readonly businessAccessService: BusinessAccessService,
   ) {}
 
   onModuleInit(): void {
@@ -59,7 +57,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     this.pollingActive = false;
   }
 
-  private async handleMessage(msg: Message, source: string): Promise<void> {
+  private async handleMessage(
+    msg: Message,
+    source: string,
+    origin: 'bot' | 'business',
+  ): Promise<void> {
     const chatId = msg.chat?.id;
     if (chatId) {
       this.lastMessages.set(chatId, msg);
@@ -71,27 +73,22 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const chatIdForOwner = msg.chat?.id;
     const businessConnectionId = (msg as any).business_connection_id as string | undefined;
     const hasBusinessConnection = Boolean(businessConnectionId);
-    const allowed = hasBusinessConnection
-      ? await this.isBusinessConnectionAllowed(businessConnectionId)
-      : await this.isDirectMessageAllowed(fromId);
+    const bot = this.ensureBot();
+    const handler = origin === 'business' ? this.businessMessageService : this.botMessageService;
+    const allowed = origin === 'business'
+      ? await handler.isAllowed(msg, bot)
+      : await handler.isAllowed(msg);
 
     if (!allowed) {
       this.logger.warn(
         `Message ignored (not owner). fromId=${fromId ?? 'unknown'} chatId=${chatIdForOwner ?? 'unknown'} ` +
-          `business=${hasBusinessConnection}`,
+          `business=${origin === 'business'} hasBusinessConnection=${hasBusinessConnection}`,
       );
       return;
     }
 
     try {
-      if (msg.text && msg.text.trim().startsWith('/')) {
-        const handled = await this.handleOwnerCommand(msg);
-        if (handled) {
-          return;
-        }
-      }
-
-      await this.autoReplyService.echo(this.ensureBot(), msg);
+      await handler.handle(bot, msg);
     } catch (err) {
       this.logger.error('Failed to auto-reply', err as Error);
     }
@@ -216,10 +213,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (update?.message) {
-      this.handleMessage(update.message as Message, 'message(raw)');
+      this.handleMessage(update.message as Message, 'message(raw)', 'bot');
     }
     if (update?.business_message) {
-      this.handleMessage(update.business_message as Message, 'business_message(raw)');
+      this.handleMessage(update.business_message as Message, 'business_message(raw)', 'business');
     }
     if (update?.edited_business_message) {
       this.handleEditedMessage(update.edited_business_message as Message);
@@ -228,201 +225,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       this.handleDeletedMessages(update.deleted_business_messages as any);
     }
     if (update?.business_connection) {
-      this.handleBusinessConnection(update.business_connection);
+      this.businessAccessService.handleBusinessConnection(update.business_connection);
     }
-  }
-
-  private async handleOwnerCommand(msg: Message): Promise<boolean> {
-    const text = msg.text?.trim() ?? '';
-    const chatId = msg.chat?.id;
-    const fromId = msg.from?.id;
-    if (!chatId || !fromId) {
-      return false;
-    }
-
-    if (!this.settingsService.isOwner(fromId)) {
-      return false;
-    }
-
-    if ((msg as any).business_connection_id) {
-      return false;
-    }
-
-    const [command, arg] = text.split(/\s+/, 2);
-
-    switch (command) {
-      case '/start': {
-        const help = [
-          'Available commands:',
-          '/add_admin <user_id> — add admin',
-          '/list_admins — list admins',
-          '/remove_admin <user_id> — remove admin',
-        ].join('\n');
-        await this.ensureBot().sendMessage(chatId, help);
-        return true;
-      }
-      case '/add_admin': {
-        const id = Number(arg);
-        if (!Number.isFinite(id)) {
-          await this.ensureBot().sendMessage(chatId, 'Usage: /add_admin <user_id>');
-          return true;
-        }
-        const ok = await this.adminStoreService.addAdmin(id);
-        await this.ensureBot().sendMessage(chatId, ok ? `Admin added: ${id}` : `Failed to add admin: ${id}`);
-        return true;
-      }
-      case '/list_admins': {
-        const list = await this.adminStoreService.listAdmins();
-        const response = list.length ? list.join('\n') : 'Admin list is empty';
-        await this.ensureBot().sendMessage(chatId, response);
-        return true;
-      }
-      case '/remove_admin': {
-        const id = Number(arg);
-        if (!Number.isFinite(id)) {
-          await this.ensureBot().sendMessage(chatId, 'Usage: /remove_admin <user_id>');
-          return true;
-        }
-        const removed = await this.adminStoreService.removeAdmin(id);
-        if (removed) {
-          this.revokeAdminAccess(id);
-        }
-        await this.ensureBot().sendMessage(chatId, removed ? `Admin removed: ${id}` : `Admin not found: ${id}`);
-        return true;
-      }
-      default:
-        return false;
-    }
-  }
-
-  private async isBusinessConnectionAllowed(businessConnectionId?: string): Promise<boolean> {
-    if (this.settingsService.isOwner(undefined)) {
-      return true;
-    }
-
-    if (!businessConnectionId) {
-      return false;
-    }
-
-    if (this.allowedBusinessConnections.has(businessConnectionId)) {
-      return true;
-    }
-
-    if (this.settingsService.isStrictBusinessConnection()) {
-      const resolvedOwnerId = await this.resolveBusinessConnectionOwner(businessConnectionId);
-      const ownerAllowed = resolvedOwnerId
-        ? this.settingsService.isOwner(resolvedOwnerId) || (await this.adminStoreService.isAdmin(resolvedOwnerId))
-        : false;
-      if (ownerAllowed) {
-        this.allowedBusinessConnections.add(businessConnectionId);
-        this.businessConnectionOwners.set(businessConnectionId, resolvedOwnerId);
-        this.logger.log(
-          `Business connection resolved via API and allowed: ${businessConnectionId} (userId=${resolvedOwnerId})`,
-        );
-        return true;
-      }
-
-      this.logger.warn(`Business connection not registered via update. Blocking: ${businessConnectionId}`);
-      return false;
-    }
-
-    this.allowedBusinessConnections.add(businessConnectionId);
-    this.logger.warn(
-      `Business connection not registered via update. Allowing and caching: ${businessConnectionId}`,
-    );
-    return true;
-  }
-
-  private async resolveBusinessConnectionOwner(businessConnectionId: string): Promise<number | undefined> {
-    const cached = this.businessConnectionOwners.get(businessConnectionId);
-    if (cached) {
-      return cached;
-    }
-
-    const bot = this.ensureBot() as any;
-
-    try {
-      if (typeof bot.getBusinessConnection === 'function') {
-        const connection = await bot.getBusinessConnection(businessConnectionId);
-        return (connection?.user?.id as number | undefined) ?? (connection?.user_id as number | undefined);
-      }
-
-      if (typeof bot._request === 'function') {
-        const connection = await bot._request('getBusinessConnection', {
-          qs: { business_connection_id: businessConnectionId },
-        });
-        return (connection?.user?.id as number | undefined) ?? (connection?.user_id as number | undefined);
-      }
-    } catch (err) {
-      this.logger.warn(
-        `Failed to resolve business connection owner for ${businessConnectionId}: ${(err as Error).message}`,
-      );
-    }
-
-    return undefined;
-  }
-
-  private handleBusinessConnection(connection: any): void {
-    const connectionId =
-      (connection?.id as string | undefined) ??
-      (connection?.business_connection_id as string | undefined) ??
-      (connection?.connection_id as string | undefined);
-    const userId =
-      (connection?.user?.id as number | undefined) ??
-      (connection?.user_id as number | undefined) ??
-      (connection?.owner_id as number | undefined);
-
-    if (!connectionId) {
-      this.logger.warn(`Business connection update missing id: ${JSON.stringify(connection)}`);
-      return;
-    }
-
-    if (!userId) {
-      this.logger.warn(`Business connection update missing user id: ${JSON.stringify(connection)}`);
-      return;
-    }
-
-    const allow = this.settingsService.isOwner(userId);
-    if (allow) {
-      this.allowedBusinessConnections.add(connectionId);
-      this.businessConnectionOwners.set(connectionId, userId);
-      this.logger.log(`Business connection allowed: ${connectionId} (userId=${userId})`);
-      return;
-    }
-
-    // For admins, resolve lazily via API in strict mode.
-    if (!this.settingsService.isStrictBusinessConnection()) {
-      this.allowedBusinessConnections.add(connectionId);
-      this.businessConnectionOwners.set(connectionId, userId);
-      this.logger.log(`Business connection allowed (non-strict): ${connectionId} (userId=${userId})`);
-      return;
-    }
-
-    this.logger.warn(
-      `Business connection ignored: ${connectionId} (userId=${userId}) not in OWNER_ID`,
-    );
-  }
-
-  private revokeAdminAccess(userId: number): void {
-    for (const [connectionId, ownerId] of this.businessConnectionOwners.entries()) {
-      if (ownerId === userId) {
-        this.businessConnectionOwners.delete(connectionId);
-        this.allowedBusinessConnections.delete(connectionId);
-      }
-    }
-  }
-
-  private async isDirectMessageAllowed(fromId?: number): Promise<boolean> {
-    if (this.settingsService.isOwner(undefined)) {
-      return true;
-    }
-
-    if (!fromId) return false;
-
-    if (this.settingsService.isOwner(fromId)) {
-      return true;
-    }
-
-    return this.adminStoreService.isAdmin(fromId);
   }
 }

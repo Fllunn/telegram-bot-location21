@@ -5,7 +5,11 @@ import TelegramBot, { Message } from 'node-telegram-bot-api';
 export class AutoReplyService {
   private readonly logger = new Logger(AutoReplyService.name);
 
-  async echo(bot: TelegramBot, msg: Message): Promise<void> {
+  async echo(
+    bot: TelegramBot,
+    msg: Message,
+    origin: 'bot' | 'business',
+  ): Promise<void> {
     const chatId = msg.chat?.id;
     if (!chatId) {
       this.logger.warn('Cannot echo message: chat id is missing.');
@@ -14,9 +18,10 @@ export class AutoReplyService {
 
     const businessConnectionId = (msg as any).business_connection_id as string | undefined;
     const baseOptions = businessConnectionId ? { business_connection_id: businessConnectionId } : {};
+    const suffix = origin === 'business' ? 'Это бизнес' : 'Это бот';
 
     if (msg.text) {
-      await bot.sendMessage(chatId, msg.text, {
+      await bot.sendMessage(chatId, this.appendSuffix(msg.text, suffix), {
         ...baseOptions,
         reply_to_message_id: msg.message_id,
       } as any);
@@ -27,7 +32,7 @@ export class AutoReplyService {
       const photo = msg.photo[msg.photo.length - 1];
       await bot.sendPhoto(chatId, photo.file_id, {
         ...baseOptions,
-        caption: msg.caption,
+        caption: this.appendSuffix(msg.caption, suffix),
         reply_to_message_id: msg.message_id,
       } as any);
       return;
@@ -36,7 +41,7 @@ export class AutoReplyService {
     if (msg.video) {
       await bot.sendVideo(chatId, msg.video.file_id, {
         ...baseOptions,
-        caption: msg.caption,
+        caption: this.appendSuffix(msg.caption, suffix),
         reply_to_message_id: msg.message_id,
       } as any);
       return;
@@ -53,7 +58,7 @@ export class AutoReplyService {
     if (msg.document) {
       await bot.sendDocument(chatId, msg.document.file_id, {
         ...baseOptions,
-        caption: msg.caption,
+        caption: this.appendSuffix(msg.caption, suffix),
         reply_to_message_id: msg.message_id,
       } as any);
       return;
@@ -62,7 +67,7 @@ export class AutoReplyService {
     if (msg.animation) {
       await bot.sendAnimation(chatId, msg.animation.file_id, {
         ...baseOptions,
-        caption: msg.caption,
+        caption: this.appendSuffix(msg.caption, suffix),
         reply_to_message_id: msg.message_id,
       } as any);
       return;
@@ -71,7 +76,7 @@ export class AutoReplyService {
     if (msg.audio) {
       await bot.sendAudio(chatId, msg.audio.file_id, {
         ...baseOptions,
-        caption: msg.caption,
+        caption: this.appendSuffix(msg.caption, suffix),
         reply_to_message_id: msg.message_id,
       } as any);
       return;
@@ -104,5 +109,12 @@ export class AutoReplyService {
     }
 
     this.logger.warn(`No echo handler for message id ${msg.message_id}`);
+  }
+
+  private appendSuffix(text: string | undefined, suffix: string): string {
+    if (!text || !text.trim()) {
+      return suffix;
+    }
+    return `${text}\n${suffix}`;
   }
 }
